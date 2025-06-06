@@ -1,8 +1,11 @@
+
+
 import re
 import json
 from datetime import datetime, timedelta
 from collections import defaultdict
 import asyncio
+from parse_signals import start_parser_bot  # ← Added import for parser
 
 # Configuration
 CONFIG = {
@@ -30,17 +33,21 @@ def get_trading_days(mode, ref_date=None):
     elif mode == "week":
         weekday = ref_date.weekday()
         start_of_week = ref_date - timedelta(days=weekday)
-        days_to_include = 4 if weekday == 3 else (5 if weekday in [5, 6] else weekday + 1)
         if weekday in [5, 6]:
             start_of_week -= timedelta(days=7)
-        return [(start_of_week + timedelta(days=i)).strftime("%Y-%m-%d")
-                for i in range(days_to_include)
-                if (start_of_week + timedelta(days=i)).weekday() < 5]
+        return [
+            (start_of_week + timedelta(days=i)).strftime("%Y-%m-%d")
+            for i in range(5)
+            if (start_of_week + timedelta(days=i)).weekday() < 5
+        ]
     elif mode == "month":
         start_of_month = ref_date.replace(day=1)
-        return [(start_of_month + timedelta(days=i)).strftime("%Y-%m-%d")
-                for i in range((ref_date - start_of_month).days + 1)
-                if (start_of_month + timedelta(days=i)).weekday() < 5]
+        days = (ref_date - start_of_month).days + 1
+        return [
+            (start_of_month + timedelta(days=i)).strftime("%Y-%m-%d")
+            for i in range(days)
+            if (start_of_month + timedelta(days=i)).weekday() < 5
+        ]
     return []
 
 def build_prompt_for_lines(lines, date_list):
@@ -56,7 +63,7 @@ Return a valid JSON array. Each object must include:
 - entry (e.g., "$1.17" or null if not found)
 - exit (e.g., "$2.10" or null if not found)
 - status ("open" or "closed")
-- summary ("yes" if entry date is in {date_list}, "no" otherwise)
+- summary ("yes" if the trade’s relevant date—exit for closed, entry for open—is in {date_list}, otherwise "no")
 - entry_time (e.g., "2025-06-02 14:38" or null if not found)
 - exit_time (e.g., "2025-06-03 11:04" or null if not found)
 
@@ -87,9 +94,12 @@ def find_entry_in_channel(channel_lines, ticker, exit_time, channel, openai_clie
 
         fmt = "%Y-%m-%d %H:%M"
         dt_exit = datetime.strptime(exit_time, fmt)
+
+        # Normalize ticker comparison to be case-insensitive
+        ticker_upper = ticker.upper()
         valid_entries = [
             trade for trade in trades
-            if trade["ticker"] == ticker
+            if trade["ticker"].upper() == ticker_upper
             and trade["channel"] == channel
             and trade["entry_time"]
             and datetime.strptime(trade["entry_time"], fmt) < dt_exit
@@ -153,6 +163,17 @@ def format_trade(trade):
     return trade_str
 
 async def run_trade_summary(mode, message, openai_client):
+    # ─────────────────────────────────────────────────────────────────────────────
+    # FIRST THING: Run parse_signals.py when !data is invoked
+    await message.channel.send("🔄 Running parse_signals.py...")
+    try:
+        await start_parser_bot()
+        await message.channel.send("✅ `parse_signals.py` ran successfully.")
+    except Exception as e:
+        await message.channel.send(f"❌ Exception occurred while running parser: {str(e)}")
+        return
+    # ─────────────────────────────────────────────────────────────────────────────
+
     from discord import File
     now = datetime.now()
     date_list = get_trading_days(mode, now)
@@ -163,7 +184,7 @@ async def run_trade_summary(mode, message, openai_client):
     print(f"[Analytics] Starting trade summary for: {mode}")
     await message.channel.send(f":inbox_tray: Collecting messages for `{mode}`...")
 
-    # Read and cache channel lines
+    # 1) Read full channel dump (all timestamps), store by tier.
     channel_lines = defaultdict(list)
     try:
         with open(CONFIG["channel_dump_file"], "r", encoding="utf-8") as f:
@@ -179,15 +200,29 @@ async def run_trade_summary(mode, message, openai_client):
         await message.channel.send(f"❌ Error reading channel dump: {str(e)}")
         return
 
-    # Filter lines for the specified date range
-    filtered_lines = [line for lines in channel_lines.values() for line in lines if any(f"[{date}" in line for date in date_list)]
+    # 2) Filter just the lines that mention any date in our week/month,
+    #    so we can send those to the LLM to extract trades.
+    filtered_lines = [
+        line
+        for lines in channel_lines.values()
+        for line in lines
+        if any(f"[{date}" in line for date in date_list)
+    ]
     output_filename = now.strftime("%m%d%Y") + f"_{mode}_signals.txt"
     with open(output_filename, "w", encoding="utf-8") as f:
         f.writelines(filtered_lines)
 
     await message.channel.send("📊 Parsing signals by tier...")
-    tiered_lines = {tier: [line for line in lines if any(f"[{date}" in line for date in date_list)] for tier, lines in channel_lines.items()}
-    
+
+    # 3) For each tier, keep only those lines in date_list (this is what we feed to the LLM)
+    tiered_lines = {
+        tier: [
+            line for line in lines
+            if any(f"[{date}" in line for date in date_list)
+        ]
+        for tier, lines in channel_lines.items()
+    }
+
     all_trades = []
     for i, (tier, lines) in enumerate(tiered_lines.items(), start=1):
         if not lines:
@@ -206,14 +241,22 @@ async def run_trade_summary(mode, message, openai_client):
             )
             cleaned_json = re.sub(r"^```(?:json)?|```$", "", response.choices[0].message.content.strip(), flags=re.MULTILINE).strip()
             trades = json.loads(cleaned_json)
+
+            # *** FIX #1: Summary‐flagging now uses exit_date for closed trades ***
             for trade in trades:
                 entry_day = trade["entry_time"].split()[0] if trade["entry_time"] else None
-                trade["summary"] = "yes" if entry_day in date_list else "no"
+                exit_day  = trade["exit_time"].split()[0] if trade["exit_time"] else None
+
+                if trade["status"] == "closed":
+                    trade["summary"] = "yes" if exit_day in date_list else "no"
+                else:
+                    trade["summary"] = "yes" if entry_day in date_list else "no"
             all_trades.extend(trades)
         except Exception as e:
             print(f"❌ Error parsing tier {tier}: {e}")
 
-    # Process trades with missing entries
+    # 4) For each closed trade with no entry (or summary=="no" but exit_in_week),
+    #    do an “extra search” over the FULL channel dump (all dates).
     for trade in all_trades:
         if trade["status"] == "closed" and trade["exit_time"] and (not trade["entry_time"] or trade["summary"] == "no"):
             channel = trade["channel"]
@@ -225,13 +268,20 @@ async def run_trade_summary(mode, message, openai_client):
             if tier:
                 entry_trade = find_entry_in_channel(channel_lines[tier], ticker, exit_time, channel, openai_client)
                 if entry_trade and entry_trade["entry"] and entry_trade["entry_time"]:
+                    # *** FIX #2: No longer require entry_day ∈ date_list ***
                     trade["entry"] = entry_trade["entry"]
                     trade["entry_time"] = entry_trade["entry_time"]
+                    # We already know exit_day is in date_list (otherwise summary would be "no" earlier)
                     trade["summary"] = "yes"
-                    trade["type"] = entry_trade["type"] or trade["type"]
+                    trade["type"]   = entry_trade["type"]   or trade["type"]
                     trade["expiry"] = entry_trade["expiry"] or trade["expiry"]
+                else:
+                    print(f"⚠️ Warning: entry missing for {ticker} closed at {exit_time}. Skipping.")
 
+    # 5) Keep exactly those trades whose “relevant date” sits in date_list
     summary_trades = [t for t in all_trades if t.get("summary") == "yes"]
+
+    # 6) Group by (channel, ticker, entry_time) so that partial exits merge into one trade
     grouped_trades = defaultdict(list)
     for trade in summary_trades:
         key = (trade["channel"], trade["ticker"], trade["entry_time"])
@@ -239,102 +289,163 @@ async def run_trade_summary(mode, message, openai_client):
 
     trade_details = []
     win_count = loss_count = open_count = 0
+
     for (channel, ticker, entry_time), trades in grouped_trades.items():
         try:
-            entry = float(trades[0]["entry"].replace("$", "")) if trades[0]["entry"] else None
-            if entry is None:
+            # Try to parse entry_price; if None, that means we never found an entry.
+            entry_price = float(trades[0]["entry"].replace("$", "")) if trades[0]["entry"] else None
+            if entry_price is None:
+                print(f"⚠️ Warning: entry missing for {ticker} closed at {trades[0]['exit_time']}. Skipping.")
                 continue
+
             exits = []
-            for trade in trades:
-                if trade.get("status") == "closed" and trade.get("exit"):
+            for tr in trades:
+                if tr.get("status") == "closed" and tr.get("exit"):
                     try:
-                        exit_price = float(trade["exit"].replace("$", ""))
+                        exit_price = float(tr["exit"].replace("$", ""))
                         fmt = "%Y-%m-%d %H:%M"
-                        dt_entry = datetime.strptime(trade["entry_time"], fmt)
-                        dt_exit = datetime.strptime(trade["exit_time"], fmt)
+                        dt_entry = datetime.strptime(tr["entry_time"], fmt)
+                        dt_exit  = datetime.strptime(tr["exit_time"], fmt)
                         duration = int((dt_exit - dt_entry).total_seconds() / 60)
                         exits.append({
                             "exit": exit_price,
-                            "change": ((exit_price - entry) / entry) * 100,
-                            "duration": duration
+                            "change": ((exit_price - entry_price) / entry_price) * 100,
+                            "duration": duration,
+                            "exit_date": tr["exit_time"].split()[0]
                         })
                     except Exception as e:
                         print(f"⚠️ Error processing exit for {ticker}: {e}")
                         continue
+
             if exits:
-                avg_change = sum(e["change"] for e in exits) / len(exits)
+                # Closed trade: use the last exit_date as our “trade_date”
+                last_exit = exits[-1]
+                trade_date = last_exit["exit_date"]
+                avg_change   = sum(e["change"] for e in exits) / len(exits)
                 avg_duration = sum(e["duration"] for e in exits) / len(exits)
                 trade_details.append({
                     "channel": channel,
                     "ticker": ticker,
                     "type": trades[0]["type"],
-                    "entry": entry,
+                    "entry": entry_price,
                     "percent_change": round(avg_change, 2),
                     "duration": f"{int(avg_duration)}m",
                     "status": "closed",
                     "partial": len(exits) > 1,
                     "exits": [f"${e['exit']}" for e in exits],
-                    "entry_date": trades[0]["entry_time"].split()[0]
+                    "trade_date": trade_date
                 })
                 if avg_change > 0:
                     win_count += 1
                 else:
                     loss_count += 1
             else:
-                open_count += 1
+                # Open trade
+                entry_date = trades[0]["entry_time"].split()[0]
                 trade_details.append({
                     "channel": channel,
                     "ticker": ticker,
                     "type": trades[0]["type"],
-                    "entry": entry,
+                    "entry": entry_price,
                     "percent_change": 0.0,
                     "duration": "0m",
                     "status": "open",
                     "partial": False,
                     "exits": [],
-                    "entry_date": trades[0]["entry_time"].split()[0]
+                    "trade_date": entry_date
                 })
+                open_count += 1
+
         except Exception as e:
             print(f"⚠️ Skipping grouped trade due to error: {e}")
 
+    # 7) Compute aggregates
     closed_trades = [t for t in trade_details if t["status"] == "closed"]
-    avg_percent_increase = round(sum(t["percent_change"] for t in closed_trades) / len(closed_trades), 2) if closed_trades else 0.00
-    total_profit = sum(sum(float(e.replace("$", "")) for e in t["exits"]) / len(t["exits"]) - t["entry"] for t in closed_trades)
+    avg_percent_increase = round(
+        sum(t["percent_change"] for t in closed_trades) / len(closed_trades), 2
+    ) if closed_trades else 0.00
+    total_profit = sum(
+        sum(float(e.replace("$", "")) for e in t["exits"]) / len(t["exits"]) - t["entry"]
+        for t in closed_trades
+    )
     total_profit = round(total_profit, 2)
 
-    # Format summary
-    win_label = "Win" if win_count == 1 else "Wins"
+    win_label  = "Win" if win_count == 1 else "Wins"
     loss_label = "Loss" if loss_count == 1 else "Losses"
-    open_label = "Open Position" if open_count == 1 else "Open Positions"
-    
+    # open_label is no longer used at the top for week/month
+
+    # 8) Build final summary text
     if mode == "week":
         trades_by_day = defaultdict(list)
         for t in trade_details:
-            trades_by_day[t["entry_date"]].append(t)
+            trades_by_day[t["trade_date"]].append(t)
+
+        # *** FIX #3: Remove open_count from the top line; only show Wins/Losses ***
         summary_title = f"**Weekly Trade Summary for {now.strftime('%m/%d/%Y')} @everyone**"
         full_message = f"{summary_title}\n\n"
-        full_message += f"Total Trades: {win_count + loss_count + open_count} ({win_count} {win_label}, {loss_count} {loss_label}, {open_count} {open_label})\n"
+        total_trades = win_count + loss_count
+        full_message += (
+            f"Total Trades: {total_trades} "
+            f"({win_count} {win_label}, {loss_count} {loss_label})\n"
+        )
         full_message += f"Average Percent Increase: {avg_percent_increase}%\n\n"
+
         for date in sorted(trades_by_day.keys()):
-            day_trades = trades_by_day[date]
-            day_closed = [t for t in day_trades if t["status"] == "closed"]
-            day_wins = len([t for t in day_closed if t["percent_change"] > 0])
-            day_losses = len([t for t in day_closed if t["percent_change"] <= 0])
-            day_avg_percent = round(sum(t["percent_change"] for t in day_closed) / len(day_closed), 2) if day_closed else 0.00
+            if date not in date_list:
+                continue
+
+            day_trades  = trades_by_day[date]
+            day_closed  = [t for t in day_trades if t["status"] == "closed"]
+            day_wins    = len([t for t in day_closed if t["percent_change"] > 0])
+            day_losses  = len([t for t in day_closed if t["percent_change"] <= 0])
+            day_avg_pct = (
+                round(sum(t["percent_change"] for t in day_closed) / len(day_closed), 2)
+                if day_closed else 0.00
+            )
             dt = datetime.strptime(date, "%Y-%m-%d")
             formatted_date = f"{CONFIG['day_names'][dt.weekday()]} ({dt.strftime('%m/%d/%Y')}):"
             full_message += f"{formatted_date}\n"
-            full_message += f"- Total Trades: {len(day_trades)} ({day_wins} {'Win' if day_wins == 1 else 'Wins'}, {day_losses} {'Loss' if day_losses == 1 else 'Losses'})\n"
-            full_message += f"- Average Percent Increase: {day_avg_percent}%\n\n"
-        full_message += f"If you bought one contract for each trade this week, you would've made ${total_profit:.2f}\n\n"
+            full_message += (
+                f"- Total Trades: {len(day_trades)} "
+                f"({day_wins} {'Win' if day_wins == 1 else 'Wins'}, {day_losses} "
+                f"{'Loss' if day_losses == 1 else 'Losses'})\n"
+            )
+            full_message += f"- Average Percent Increase: {day_avg_pct}%\n\n"
+
+        # *** FIX #4: Multiply total_profit by 100 and remove decimals ***
+        profit_cents = int(total_profit * 100)
+        full_message += f"If you bought one contract for each trade this week, you would've made ${profit_cents}\n\n"
+
     else:
+        # Daily or Monthly
         channel_grouped = defaultdict(list)
         for t in trade_details:
             channel_grouped[t["channel"]].append(t)
-        summary_title = f"**{'Daily' if mode == 'today' else 'Monthly'} Trade Summary for {now.strftime('%m/%d/%Y' if mode == 'today' else '%B')} @everyone**"
+
+        is_monthly = (mode == "month")
+        summary_title = (
+            f"**{'Daily' if mode == 'today' else 'Monthly'} Trade Summary for "
+            f"{now.strftime('%m/%d/%Y' if mode == 'today' else '%B')} @everyone**"
+        )
         full_message = f"{summary_title}\n\n"
-        full_message += f"Total Trades: {win_count + loss_count + open_count} ({win_count} {win_label}, {loss_count} {loss_label}, {open_count} {open_label})\n"
+
+        # *** FIX #3: If this is monthly (mode=="month"), remove open_count from top ***
+        if is_monthly:
+            total_trades = win_count + loss_count
+            full_message += (
+                f"Total Trades: {total_trades} "
+                f"({win_count} {win_label}, {loss_count} {loss_label})\n"
+            )
+        else:
+            # If mode=="today", keep the open_count in the top line
+            total_trades = win_count + loss_count + open_count
+            full_message += (
+                f"Total Trades: {total_trades} "
+                f"({win_count} {win_label}, {loss_count} {loss_label}, {open_count} Open {'Position' if open_count==1 else 'Positions'})\n"
+            )
+
         full_message += f"Average Percent Increase: {avg_percent_increase}%\n\n"
+
         for ch, trades in channel_grouped.items():
             normalized_ch = next((t for t, c in CONFIG["channels"].items() if c == ch), "unknown")
             ch_name = CONFIG["channel_names"].get(normalized_ch, f"Tier {normalized_ch}")
@@ -343,7 +454,15 @@ async def run_trade_summary(mode, message, openai_client):
                 full_message += format_trade(t) + "\n"
             full_message += "\n"
 
-    full_message += "**:closed_lock_with_key: Want to see our open trades?** [Get a premium membership!](https://discord.com/channels/1350549258310385694/1372399067514011749)\n"
+        # *** FIX #4: For monthly, also multiply total_profit by 100 at the bottom ***
+        if is_monthly:
+            profit_cents = int(total_profit * 100)
+            full_message += f"If you bought one contract for each trade this month, you would've made ${profit_cents}\n\n"
+
+    full_message += (
+        "**:closed_lock_with_key: Want to see our open trades?** "
+        "[Get a premium membership!](https://discord.com/channels/1350549258310385694/1372399067514011749)\n"
+    )
     full_message = check_summary_for_inconsistencies(full_message, open_count, trade_details, openai_client)
 
     if output_channel := message.guild.get_channel(CONFIG["output_channel_id"]):
