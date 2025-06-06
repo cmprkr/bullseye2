@@ -3,7 +3,7 @@ import asyncio
 
 # --- Discord Setup ---
 DISCORD_TOKEN = ""
-# TARGET_CHANNEL_ID = 1379815950588842105
+TARGET_CHANNEL_ID = 1379132047783624717
 
 client = discord.Client(intents=discord.Intents.default())
 
@@ -14,20 +14,21 @@ async def on_ready():
     if channel:
         message = """
 
-**Daily Trade Summary for 06/05/2025 @everyone**
+**Daily Trade Summary for 06/06/2025 @everyone**
 
-Total Trades: 6 (4 Wins, 1 Loss, 1 Open Position)
+Total Trades: 5 (4 Wins, 0 Losses, 1 Open Position)
 
-**Tier 1:**
-- SPX put @ $2.45. Sold at $3.15 8m later for a 28.57% gain :fire: :chart_with_upwards_trend:
+Tier 1:
+- SPY put @ $0.97. Sold at $1.07 2m later for a 10.31% gain :fire: :chart_with_upwards_trend:
+- SPX call @ $0.95. Sold at $0.00 0m later for a 00.00% gain 
 
-**Tier 2:**
-- SPY call @ $0.48. Sold at $0.63 3m later for a 31.25% gain :fire: :chart_with_upwards_trend:
-- SPY put @ $0.7. Sold at $0.35 11m later for a -50.0% gain
-- SPY call @ $0.64. Sold some at $0.74, $0.77 for a 17.97% avg gain :fire: :chart_with_upwards_trend:
+Tier 2:
+- SPY call @ $1.00. Sold at $1.1 16m later for a 10.0% gain :fire: :chart_with_upwards_trend:
+- SPY put @ $1.15. Sold at $1.25 16m later for a 8.7% gain :fire: :chart_with_upwards_trend:
 
-**Tier 3:**
-- NBIS call @ $1.75. Sold at $3.50 1114m later for a 100.0% gain :fire: :fire: :fire:
+Tier 3:
+- DELL call @ $1.88. Sold at $1.96 1203m later for a 4.26% gain :fire: :chart_with_upwards_trend:
+- TEM call @ $0.45. Sold at $0.15 117m later for a 66.67% loss
 
 🔒 Want to see our open trades? [Get a premium membership](https://discord.com/channels/1350549258310385694/1372399067514011749)!
 """

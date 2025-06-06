@@ -12,7 +12,7 @@ OPENAI_KEY = ""
 
 CHANNEL_ID_TRIGGER = 1379132047783624717
 CHANNEL_ID_SECONDARY_OUTPUT = 1379132006629118113
-CHANNEL_ID_TERTIARY_OUTPUT = 123456789012345678  # ← replace with your live output channel ID
+CHANNEL_ID_TERTIARY_OUTPUT = 1379815950588842105  # ← replace with your live output channel ID
 
 client = discord.Client(intents=discord.Intents.all())
 openai_client = OpenAI(api_key=OPENAI_KEY)

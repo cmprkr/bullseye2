@@ -1,5 +1,3 @@
-
-
 import re
 import json
 from datetime import datetime, timedelta
@@ -63,17 +61,23 @@ Return a valid JSON array. Each object must include:
 - entry (e.g., "$1.17" or null if not found)
 - exit (e.g., "$2.10" or null if not found)
 - status ("open" or "closed")
-- summary ("yes" if the trade’s relevant date—exit for closed, entry for open—is in {date_list}, otherwise "no")
+- summary ("yes" if the trade’s relevant date—exit for closed, entry for open—is in {date_list}, otherwise "no". to clarify, "summary" should be set to yes if an open trade with the entry date is found or if a closed trade with the exit date is found)
 - entry_time (e.g., "2025-06-02 14:38" or null if not found)
 - exit_time (e.g., "2025-06-03 11:04" or null if not found)
 
 Rules:
-- Match "Exit TICKER @PRICE" or "Exit TICKER" with the most recent unmatched entry of the same ticker in the same channel *only if* the exit time is **after** the entry time.
+- Only interpret lines that explicitly say “Entry TICKER @PRICE” or “Exit TICKER @PRICE” (or very close variants) as actual signals.
+- Ignore messages that look like “guidance” or “reminders,” for example anything starting with phrases like:
+    • “Whoever didn’t exit”
+    • “Just in case you didn’t exit”
+    • “If you haven’t exited”
+  These are not new Exit signals—they’re just commentary referencing a previous exit.
+- Match "Exit TICKER @PRICE" or "Exit TICKER" with the most recent unmatched entry of the same ticker in the same channel only if the exit time is after the entry time.
 - If an exit is found without a matching entry in the provided logs, include the trade with status="closed", entry=null, entry_time=null, and summary="no".
-- Ignore commentary unless it includes entry/exit details.
-- Status is "closed" if an exit is found, "open" if only an entry.
+- Ignore any other commentary that does not include explicit entry/exit details.
+- Status is "closed" if an exit is found; "open" if only an entry is present.
 - Use date format YYYY-MM-DD HH:MM for entry_time and exit_time.
-
+  
 Chat Messages:
 {''.join(lines)}
 """
@@ -165,13 +169,13 @@ def format_trade(trade):
 async def run_trade_summary(mode, message, openai_client):
     # ─────────────────────────────────────────────────────────────────────────────
     # FIRST THING: Run parse_signals.py when !data is invoked
-    await message.channel.send("🔄 Running parse_signals.py...")
-    try:
-        await start_parser_bot()
-        await message.channel.send("✅ `parse_signals.py` ran successfully.")
-    except Exception as e:
-        await message.channel.send(f"❌ Exception occurred while running parser: {str(e)}")
-        return
+    #await message.channel.send("🔄 Running parse_signals.py...")
+    #try:
+    #    await start_parser_bot()
+    #    await message.channel.send("✅ `parse_signals.py` ran successfully.")
+    #except Exception as e:
+    #    await message.channel.send(f"❌ Exception occurred while running parser: {str(e)}")
+    #    return
     # ─────────────────────────────────────────────────────────────────────────────
 
     from discord import File
@@ -223,6 +227,27 @@ async def run_trade_summary(mode, message, openai_client):
         for tier, lines in channel_lines.items()
     }
 
+    # ─── NEW FIX ─────────────────────────────────────────────────────────────────
+    # Normalize any “TICKER … EOD @PRICE” lines into “Entry TICKER @PRICE”
+    for tier, lines in tiered_lines.items():
+        normalized = []
+        for line in lines:
+            # If a line contains “EOD @” but does not already include “Entry”, convert it
+            if " EOD @" in line and "entry" not in line.lower():
+                # Example: “[2025-06-06 12:50] ...: TEM 63C EOD @0.45$ ...”
+                # → “[2025-06-06 12:50] ...: Entry TEM 63C @0.45$ ...”
+                normalized_line = re.sub(
+                    r"(\b[A-Z0-9]{1,5}\s*\d+[CP]\b)\s+EOD\s+@",
+                    r"Entry \1 @",
+                    line,
+                    flags=re.IGNORECASE
+                )
+                normalized.append(normalized_line)
+            else:
+                normalized.append(line)
+        tiered_lines[tier] = normalized
+    # ─────────────────────────────────────────────────────────────────────────────
+
     all_trades = []
     for i, (tier, lines) in enumerate(tiered_lines.items(), start=1):
         if not lines:
@@ -241,6 +266,7 @@ async def run_trade_summary(mode, message, openai_client):
             )
             cleaned_json = re.sub(r"^```(?:json)?|```$", "", response.choices[0].message.content.strip(), flags=re.MULTILINE).strip()
             trades = json.loads(cleaned_json)
+            print(trades)
 
             # *** FIX #1: Summary‐flagging now uses exit_date for closed trades ***
             for trade in trades:
@@ -249,8 +275,11 @@ async def run_trade_summary(mode, message, openai_client):
 
                 if trade["status"] == "closed":
                     trade["summary"] = "yes" if exit_day in date_list else "no"
+                elif trade["status"] == "open":
+                    trade["summary"] = "yes"
                 else:
                     trade["summary"] = "yes" if entry_day in date_list else "no"
+
             all_trades.extend(trades)
         except Exception as e:
             print(f"❌ Error parsing tier {tier}: {e}")
@@ -361,9 +390,18 @@ async def run_trade_summary(mode, message, openai_client):
 
     # 7) Compute aggregates
     closed_trades = [t for t in trade_details if t["status"] == "closed"]
-    avg_percent_increase = round(
-        sum(t["percent_change"] for t in closed_trades) / len(closed_trades), 2
-    ) if closed_trades else 0.00
+
+    # Weighted average percent increase
+    if closed_trades:
+        total_weight = sum(t["entry"] for t in closed_trades)
+        if total_weight > 0:
+            weighted_sum = sum(t["percent_change"] * t["entry"] for t in closed_trades)
+            avg_percent_increase = round(weighted_sum / total_weight, 2)
+        else:
+            avg_percent_increase = 0.00
+    else:
+        avg_percent_increase = 0.00
+
     total_profit = sum(
         sum(float(e.replace("$", "")) for e in t["exits"]) / len(t["exits"]) - t["entry"]
         for t in closed_trades
@@ -372,7 +410,6 @@ async def run_trade_summary(mode, message, openai_client):
 
     win_label  = "Win" if win_count == 1 else "Wins"
     loss_label = "Loss" if loss_count == 1 else "Losses"
-    # open_label is no longer used at the top for week/month
 
     # 8) Build final summary text
     if mode == "week":
@@ -380,7 +417,6 @@ async def run_trade_summary(mode, message, openai_client):
         for t in trade_details:
             trades_by_day[t["trade_date"]].append(t)
 
-        # *** FIX #3: Remove open_count from the top line; only show Wins/Losses ***
         summary_title = f"**Weekly Trade Summary for {now.strftime('%m/%d/%Y')} @everyone**"
         full_message = f"{summary_title}\n\n"
         total_trades = win_count + loss_count
@@ -398,10 +434,18 @@ async def run_trade_summary(mode, message, openai_client):
             day_closed  = [t for t in day_trades if t["status"] == "closed"]
             day_wins    = len([t for t in day_closed if t["percent_change"] > 0])
             day_losses  = len([t for t in day_closed if t["percent_change"] <= 0])
-            day_avg_pct = (
-                round(sum(t["percent_change"] for t in day_closed) / len(day_closed), 2)
-                if day_closed else 0.00
-            )
+
+            # Weighted average per day
+            if day_closed:
+                day_weight = sum(t["entry"] for t in day_closed)
+                if day_weight > 0:
+                    day_weighted_sum = sum(t["percent_change"] * t["entry"] for t in day_closed)
+                    day_avg_pct = round(day_weighted_sum / day_weight, 2)
+                else:
+                    day_avg_pct = 0.00
+            else:
+                day_avg_pct = 0.00
+
             dt = datetime.strptime(date, "%Y-%m-%d")
             formatted_date = f"{CONFIG['day_names'][dt.weekday()]} ({dt.strftime('%m/%d/%Y')}):"
             full_message += f"{formatted_date}\n"
@@ -412,7 +456,6 @@ async def run_trade_summary(mode, message, openai_client):
             )
             full_message += f"- Average Percent Increase: {day_avg_pct}%\n\n"
 
-        # *** FIX #4: Multiply total_profit by 100 and remove decimals ***
         profit_cents = int(total_profit * 100)
         full_message += f"If you bought one contract for each trade this week, you would've made ${profit_cents}\n\n"
 
@@ -429,7 +472,6 @@ async def run_trade_summary(mode, message, openai_client):
         )
         full_message = f"{summary_title}\n\n"
 
-        # *** FIX #3: If this is monthly (mode=="month"), remove open_count from top ***
         if is_monthly:
             total_trades = win_count + loss_count
             full_message += (
@@ -437,7 +479,7 @@ async def run_trade_summary(mode, message, openai_client):
                 f"({win_count} {win_label}, {loss_count} {loss_label})\n"
             )
         else:
-            # If mode=="today", keep the open_count in the top line
+            # For "today", include open positions so total = wins + losses + open_count
             total_trades = win_count + loss_count + open_count
             full_message += (
                 f"Total Trades: {total_trades} "
@@ -454,13 +496,12 @@ async def run_trade_summary(mode, message, openai_client):
                 full_message += format_trade(t) + "\n"
             full_message += "\n"
 
-        # *** FIX #4: For monthly, also multiply total_profit by 100 at the bottom ***
         if is_monthly:
             profit_cents = int(total_profit * 100)
             full_message += f"If you bought one contract for each trade this month, you would've made ${profit_cents}\n\n"
 
     full_message += (
-        "**:closed_lock_with_key: Want to see our open trades?** "
+        ":closed_lock_with_key: Want to see our open trades? "
         "[Get a premium membership!](https://discord.com/channels/1350549258310385694/1372399067514011749)\n"
     )
     full_message = check_summary_for_inconsistencies(full_message, open_count, trade_details, openai_client)
